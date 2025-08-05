@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Application Stack - ECS cluster, task definitions, EventBridge scheduling, and CloudWatch logs for Scheduled File Writer"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: "scheduled-file-writer"
+    Description: "Name of the application for resource naming"
+
+  ECRRepositoryURI:
+    Type: String
+    Description: "ECR repository URI for the application image"
+
+  CPUArchitecture:
+    Type: String
+    Default: "ARM64"
+    Description: "CPU architecture for ECS tasks (must match Docker image architecture)"
+    AllowedValues:
+      - X86_64
+      - ARM64
+
+  # Parameters from Networking Stack
+  VPCId:
+    Type: String
+    Description: "VPC ID from networking stack"
+
+  PrivateSubnetId:
+    Type: String
+    Description: "Private Subnet ID from networking stack"
+
+  ECSTaskSecurityGroupId:
+    Type: String
+    Description: "ECS Task Security Group ID from networking stack"
+
+  # Parameters from Compute Stack
+  WindowsEC2PrivateIP:
+    Type: String
+    Description: "Windows EC2 Private IP Address from compute stack"
+
+Resources:
+  # CloudWatch Log Group for ECS Tasks
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ApplicationName}"
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-ecs-logs"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # CloudWatch Log Group for ECR Operations
+  ECROperationsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ApplicationName}/ecr-operations"
+      RetentionInDays: 14
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-ecr-operations-logs"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ApplicationName}-cluster"
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-cluster"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # IAM Role for ECS Task Execution
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationName}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::prod-${AWS::Region}-starport-layer-bucket/*"
+                  - !Sub "arn:aws:s3:::prod-${AWS::Region}-starport-layer-bucket"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "s3:ExistingObjectTag/repository-name": "*"
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/*"
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/*"
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ApplicationName}:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ApplicationName}/ecr-operations:*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-ecs-execution-role"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # IAM Role for ECS Task
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationName}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ApplicationName}:*"
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/*"
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/*"
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "cloudwatch:namespace": !Sub "${ApplicationName}/ECR"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-ecs-task-role"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # ECS Task Definition
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ApplicationName}-task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: !Ref CPUArchitecture
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Sub "${ApplicationName}-container"
+          Image: !Ref ECRRepositoryURI
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-datetime-format: "%Y-%m-%d %H:%M:%S"
+          Environment:
+            - Name: FILE_SHARE_HOST
+              Value: !Ref WindowsEC2PrivateIP
+            - Name: FILE_SHARE_PATH
+              Value: '\\FileShare'
+            - Name: SMB_DOMAIN
+              Value: "WORKGROUP"
+            - Name: CONNECTION_TIMEOUT
+              Value: "30"
+            - Name: ENVIRONMENT
+              Value: "aws"
+            - Name: ECR_LOGGING_ENABLED
+              Value: "true"
+            - Name: ECR_METRICS_ENABLED
+              Value: "true"
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: APPLICATION_NAME
+              Value: !Ref ApplicationName
+          Secrets:
+            - Name: SMB_USERNAME
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/smb-credentials:username::"
+            - Name: SMB_PASSWORD
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/smb-credentials:password::"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-task-definition"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # IAM Role for EventBridge to execute ECS tasks
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationName}-eventbridge-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECSTaskExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref ECSTaskDefinition
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt ECSTaskExecutionRole.Arn
+                  - !GetAtt ECSTaskRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-eventbridge-role"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # EventBridge Rule for scheduling
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - ECSTaskDefinition
+      - EventBridgeExecutionRole
+      - ECSCluster
+    Properties:
+      Name: !Sub "${ApplicationName}-schedule"
+      Description: "Triggers ECS task every 5 minutes"
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ECSCluster.Arn
+          Id: !Sub "${ApplicationName}-target"
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref ECSTaskDefinition
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets:
+                  - !Ref PrivateSubnetId
+                SecurityGroups:
+                  - !Ref ECSTaskSecurityGroupId
+                AssignPublicIp: DISABLED
+            PlatformVersion: LATEST
+          Input: !Sub |
+            {
+              "containerOverrides": [
+                {
+                  "name": "${ApplicationName}-container",
+                  "environment": [
+                    {
+                      "name": "EXECUTION_ID",
+                      "value": "scheduled-$(date +%Y%m%d-%H%M%S)"
+                    }
+                  ]
+                }
+              ]
+            }
+
+Outputs:
+  ECSClusterArn:
+    Description: "ECS Cluster ARN"
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-cluster-arn"
+
+  ECSClusterName:
+    Description: "ECS Cluster Name"
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-cluster-name"
+
+  ECSTaskDefinitionArn:
+    Description: "ECS Task Definition ARN"
+    Value: !Ref ECSTaskDefinition
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-task-definition-arn"
+
+  ECSTaskExecutionRoleArn:
+    Description: "ECS Task Execution Role ARN"
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-execution-role-arn"
+
+  ECSTaskRoleArn:
+    Description: "ECS Task Role ARN"
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-task-role-arn"
+
+  ECSLogGroupName:
+    Description: "ECS CloudWatch Log Group Name"
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-log-group-name"
+
+  ECROperationsLogGroupName:
+    Description: "ECR Operations CloudWatch Log Group Name"
+    Value: !Ref ECROperationsLogGroup
+    Export:
+      Name: !Sub "${ApplicationName}-ecr-operations-log-group-name"
+
+  EventBridgeRuleArn:
+    Description: "EventBridge Scheduled Rule ARN"
+    Value: !GetAtt ScheduledRule.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-eventbridge-rule-arn"
+
+  EventBridgeExecutionRoleArn:
+    Description: "EventBridge Execution Role ARN"
+    Value: !GetAtt EventBridgeExecutionRole.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-eventbridge-execution-role-arn"

@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Compute Stack - Windows EC2 instance with embedded SMB setup (no S3 dependency)"
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: "scheduled-file-writer"
+    Description: "Name of the application for resource naming"
+
+  WindowsInstanceType:
+    Type: String
+    Default: "t3.micro"
+    Description: "EC2 instance type for Windows file server"
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  SMBUsername:
+    Type: String
+    Default: "smbuser"
+    Description: "Username for SMB authentication"
+    MinLength: 3
+    MaxLength: 20
+
+  SMBPassword:
+    Type: String
+    NoEcho: true
+    Description: "Password for SMB authentication (must meet Windows complexity: 8+ chars, 3 of: uppercase, lowercase, digit, special char)"
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$|^(?=.*[a-z])(?=.*[A-Z])(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$|^(?=.*[a-z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$|^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$'
+    ConstraintDescription: "Password must be 8-128 characters and contain at least 3 of: uppercase letter, lowercase letter, digit, special character (!@#$%^&*()_+-=[]{}|;:,.<>?)"
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: "Availability Zone for the private subnet"
+
+  # Parameters from Networking Stack
+  VPCId:
+    Type: String
+    Description: "VPC ID from networking stack"
+
+  PrivateSubnetId:
+    Type: String
+    Description: "Private Subnet ID from networking stack"
+
+  WindowsEC2SecurityGroupId:
+    Type: String
+    Description: "Windows EC2 Security Group ID from networking stack"
+
+Resources:
+  # IAM Role for Windows EC2 Instance (no S3 access needed)
+  WindowsEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ApplicationName}-windows-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApplicationName}/*"
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ApplicationName}/*"
+        - PolicyName: CloudFormationSignal
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-windows-ec2-role"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Instance Profile for Windows EC2
+  WindowsEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ApplicationName}-windows-ec2-profile"
+      Roles:
+        - !Ref WindowsEC2Role
+
+  # EBS Volume for Windows EC2
+  WindowsEC2Volume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Size: 20
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-windows-volume"
+        - Key: Application
+          Value: !Ref ApplicationName
+  # Windows EC2 Instance with embedded SMB setup
+  WindowsEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base}}"
+      InstanceType: !Ref WindowsInstanceType
+      SubnetId: !Ref PrivateSubnetId
+      SecurityGroupIds:
+        - !Ref WindowsEC2SecurityGroupId
+      IamInstanceProfile: !Ref WindowsEC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          # Comprehensive SMB Setup Script - Embedded in UserData for EC2Launch v2
+          # Force execution policy and create log directory
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Force -Scope LocalMachine
+
+          # Ensure temp directory exists
+          if (-not (Test-Path "C:\Windows\Temp")) {
+              New-Item -Path "C:\Windows\Temp" -ItemType Directory -Force
+          }
+
+          $LogFile = "C:\Windows\Temp\smb-setup.log"
+          function Write-Log { 
+              param($Message)
+              $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              try {
+                  "$Timestamp - $Message" | Out-File -FilePath $LogFile -Append -ErrorAction SilentlyContinue
+                  Write-Output $Message
+                  # Also write to Windows Event Log for better visibility
+                  Write-EventLog -LogName Application -Source "EC2Config" -EventId 1000 -Message $Message -ErrorAction SilentlyContinue
+              } catch {
+                  Write-Output $Message
+              }
+          }
+
+          # Create a marker file to show UserData started
+          "UserData execution started at $(Get-Date)" | Out-File -FilePath "C:\Windows\Temp\userdata-started.txt" -ErrorAction SilentlyContinue
+
+          function Send-CFNSignal {
+              param($ExitCode, $Reason = "")
+              try {
+                  # Try to send CloudFormation signal
+                  $cfnSignalPaths = @(
+                      "C:\cfn\cfn-signal.exe",
+                      "C:\Program Files\Amazon\cfn-bootstrap\cfn-signal.exe"
+                  )
+                  
+                  $cfnSignalPath = $null
+                  foreach ($path in $cfnSignalPaths) {
+                      if (Test-Path $path -ErrorAction SilentlyContinue) {
+                          $cfnSignalPath = $path
+                          break
+                      }
+                  }
+                  
+                  if ($cfnSignalPath) {
+                      Write-Log "Sending CloudFormation signal using: $cfnSignalPath"
+                      & $cfnSignalPath -e $ExitCode --stack "${AWS::StackName}" --resource "WindowsEC2Instance" --region "${AWS::Region}" --reason "$Reason"
+                  } else {
+                      Write-Log "cfn-signal not found, trying AWS CLI"
+                      aws cloudformation signal-resource --stack-name "${AWS::StackName}" --logical-resource-id "WindowsEC2Instance" --unique-id "$(hostname)" --status $(if ($ExitCode -eq 0) { "SUCCESS" } else { "FAILURE" }) --region "${AWS::Region}"
+                  }
+              } catch {
+                  Write-Log "Failed to send CloudFormation signal: $($_.Exception.Message)"
+              }
+          }
+
+          Write-Log "Starting comprehensive SMB setup"
+          Write-Log "PowerShell version: $($PSVersionTable.PSVersion)"
+          Write-Log "OS version: $(Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty Caption)"
+
+          try {
+              # Validate password complexity
+              $Username = "${SMBUsername}"
+              $Password = "${SMBPassword}"
+              
+              Write-Log "Validating password complexity for user: $Username"
+              
+              if ($Password.Length -lt 8) {
+                  throw "Password must be at least 8 characters long"
+              }
+              
+              $hasUpper = $Password -cmatch '[A-Z]'
+              $hasLower = $Password -cmatch '[a-z]'
+              $hasDigit = $Password -cmatch '[0-9]'
+              $hasSpecial = $Password -cmatch '[^a-zA-Z0-9]'
+              
+              $complexityCount = @($hasUpper, $hasLower, $hasDigit, $hasSpecial) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
+              
+              if ($complexityCount -lt 3) {
+                  throw "Password must contain at least 3 of: uppercase, lowercase, digits, special characters"
+              }
+              
+              Write-Log "Password complexity validation passed"
+              
+              # Create SMB user
+              $SecurePassword = ConvertTo-SecureString -String $Password -AsPlainText -Force
+              
+              $existingUser = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+              if ($existingUser) {
+                  Write-Log "User $Username already exists, updating password"
+                  Set-LocalUser -Name $Username -Password $SecurePassword -PasswordNeverExpires $true
+              } else {
+                  New-LocalUser -Name $Username -Password $SecurePassword -FullName "SMB Service User" -Description "User for SMB file sharing with ECS" -PasswordNeverExpires
+                  Write-Log "Created user: $Username"
+              }
+              
+              # Add user to necessary groups
+              Add-LocalGroupMember -Group "Users" -Member $Username -ErrorAction SilentlyContinue
+              Write-Log "Added user to Users group"
+              
+              # Create shared directory
+              $SharePath = "C:\FileShare"
+              if (-not (Test-Path $SharePath)) {
+                  New-Item -Path $SharePath -ItemType Directory -Force
+                  Write-Log "Created directory: $SharePath"
+              } else {
+                  Write-Log "Directory already exists: $SharePath"
+              }
+              
+              # Set directory permissions
+              Write-Log "Setting directory permissions"
+              $acl = Get-Acl $SharePath
+              
+              # Grant full control to the SMB user
+              $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($Username, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+              $acl.SetAccessRule($accessRule)
+              
+              # Grant full control to Administrators
+              $adminAccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+              $acl.SetAccessRule($adminAccessRule)
+              
+              # Grant full control to SYSTEM
+              $systemAccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+              $acl.SetAccessRule($systemAccessRule)
+              
+              Set-Acl -Path $SharePath -AclObject $acl
+              Write-Log "Set directory permissions for $SharePath"
+              
+              # Ensure SMB Server service is running
+              Write-Log "Ensuring SMB Server service is running"
+              $smbService = Get-Service -Name "LanmanServer" -ErrorAction SilentlyContinue
+              if ($smbService) {
+                  if ($smbService.Status -ne "Running") {
+                      Start-Service -Name "LanmanServer"
+                      Write-Log "Started SMB Server service"
+                  }
+                  Set-Service -Name "LanmanServer" -StartupType Automatic
+              }
+              
+              # Create SMB share
+              Write-Log "Creating SMB share"
+              $existingShare = Get-SmbShare -Name "FileShare" -ErrorAction SilentlyContinue
+              if ($existingShare) {
+                  Remove-SmbShare -Name "FileShare" -Force
+                  Write-Log "Removed existing SMB share"
+              }
+              
+              New-SmbShare -Name "FileShare" -Path $SharePath -Description "Shared folder for ECS file operations" -FullAccess $Username, "Administrators", "SYSTEM"
+              Write-Log "Created SMB share: FileShare -> $SharePath"
+              
+              # Configure SMB share permissions
+              Grant-SmbShareAccess -Name "FileShare" -AccountName $Username -AccessRight Full -Force
+              Grant-SmbShareAccess -Name "FileShare" -AccountName "Administrators" -AccessRight Full -Force
+              
+              # Remove default "Everyone" access
+              try {
+                  Revoke-SmbShareAccess -Name "FileShare" -AccountName "Everyone" -Force -ErrorAction SilentlyContinue
+                  Write-Log "Removed default 'Everyone' access from share"
+              } catch {
+                  Write-Log "Note: Could not remove 'Everyone' access (may not exist)"
+              }
+              
+              # Configure Windows Firewall for SMB
+              Write-Log "Configuring Windows Firewall for SMB"
+              $firewallRules = @(
+                  "File and Printer Sharing (SMB-In)",
+                  "File and Printer Sharing (NB-Session-In)",
+                  "File and Printer Sharing (NB-Name-In)",
+                  "File and Printer Sharing (NB-Datagram-In)"
+              )
+              
+              foreach ($rule in $firewallRules) {
+                  try {
+                      Enable-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue
+                      Write-Log "Enabled firewall rule: $rule"
+                  } catch {
+                      Write-Log "Note: Could not enable firewall rule '$rule'"
+                  }
+              }
+              
+              # Ensure port 445 is open
+              try {
+                  New-NetFirewallRule -DisplayName "SMB-Direct-In" -Direction Inbound -Protocol TCP -LocalPort 445 -Action Allow -ErrorAction SilentlyContinue
+                  Write-Log "Ensured SMB port 445 is open"
+              } catch {
+                  Write-Log "Note: SMB port 445 rule may already exist"
+              }
+              
+              # Configure SMB settings for compatibility
+              Write-Log "Configuring SMB settings"
+              try {
+                  Set-SmbServerConfiguration -EnableSMB2Protocol $true -Force -ErrorAction SilentlyContinue
+                  Set-SmbServerConfiguration -RequireSecuritySignature $false -Force -ErrorAction SilentlyContinue
+                  Write-Log "Configured SMB settings for ECS compatibility"
+              } catch {
+                  Write-Log "Note: Some SMB configuration settings could not be applied"
+              }
+              
+              # Test SMB functionality
+              Write-Log "Testing SMB functionality"
+              $testFile = Join-Path $SharePath "setup-success.txt"
+              "SMB setup completed successfully at $(Get-Date)" | Out-File -FilePath $testFile
+              Write-Log "Created test file: $testFile"
+              
+              # Test UNC path access
+              $uncPath = "\\localhost\FileShare"
+              if (Test-Path $uncPath -ErrorAction SilentlyContinue) {
+                  Write-Log "✓ SMB share is accessible via UNC path: $uncPath"
+              } else {
+                  Write-Log "✗ WARNING: SMB share not accessible via UNC path"
+              }
+              
+              # Test network connectivity
+              $networkTest = Test-NetConnection -ComputerName "localhost" -Port 445 -ErrorAction SilentlyContinue
+              if ($networkTest -and $networkTest.TcpTestSucceeded) {
+                  Write-Log "✓ SMB port 445 is accessible"
+              } else {
+                  Write-Log "✗ WARNING: SMB port 445 test failed"
+              }
+              
+              # Create additional test files
+              for ($i = 1; $i -le 3; $i++) {
+                  $additionalTestFile = Join-Path $SharePath "ecs-test-file-$i.txt"
+                  "Test file $i created during setup at $(Get-Date)" | Out-File -FilePath $additionalTestFile
+              }
+              Write-Log "Created additional test files for ECS application testing"
+              
+              Write-Log "SMB setup completed successfully"
+              
+              # Create comprehensive success marker
+              $successInfo = "SMB Setup Completed Successfully`n" +
+                           "================================`n" +
+                           "Timestamp: $(Get-Date)`n" +
+                           "Server: $env:COMPUTERNAME`n" +
+                           "SMB User: $Username`n" +
+                           "Share Name: FileShare`n" +
+                           "Share Path: C:\FileShare`n" +
+                           "UNC Path: \\$env:COMPUTERNAME\FileShare`n`n" +
+                           "Setup completed successfully - ECS tasks should now be able to connect to SMB share."
+              
+              $successInfo | Out-File -FilePath "C:\Windows\Temp\smb-setup-success.txt"
+              Write-Log "Created detailed success marker file"
+              
+              # Send success signal
+              Send-CFNSignal -ExitCode 0 -Reason "SMB setup completed successfully"
+              
+          } catch {
+              $errorMsg = "Error during SMB setup: $($_.Exception.Message)"
+              Write-Log $errorMsg
+              Write-Log "Stack trace: $($_.ScriptStackTrace)"
+              
+              $errorMsg | Out-File -FilePath "C:\Windows\Temp\smb-setup-error.txt"
+              
+              # Send failure signal
+              Send-CFNSignal -ExitCode 1 -Reason "SMB setup failed: $errorMsg"
+              
+              # Don't throw - let the instance continue running for debugging
+          }
+
+          Write-Log "User Data script execution completed"
+
+          # Create final marker file
+          "UserData execution completed at $(Get-Date)" | Out-File -FilePath "C:\Windows\Temp\userdata-completed.txt" -ErrorAction SilentlyContinue
+
+          # Final log entry
+          Write-Log "=== SMB SETUP USERDATA SCRIPT COMPLETED ==="
+          </powershell>
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-windows-server"
+        - Key: Application
+          Value: !Ref ApplicationName
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT20M
+
+  # Attach EBS Volume to Windows EC2
+  WindowsEC2VolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    DependsOn:
+      - WindowsEC2Instance
+      - WindowsEC2Volume
+    Properties:
+      Device: xvdf
+      InstanceId: !Ref WindowsEC2Instance
+      VolumeId: !Ref WindowsEC2Volume
+
+Outputs:
+  WindowsEC2InstanceId:
+    Description: "Windows EC2 Instance ID"
+    Value: !Ref WindowsEC2Instance
+    Export:
+      Name: !Sub "${ApplicationName}-windows-instance-id"
+
+  WindowsEC2PrivateIP:
+    Description: "Windows EC2 Private IP Address"
+    Value: !GetAtt WindowsEC2Instance.PrivateIp
+    Export:
+      Name: !Sub "${ApplicationName}-windows-private-ip"
+
+  WindowsEC2RoleArn:
+    Description: "Windows EC2 IAM Role ARN"
+    Value: !GetAtt WindowsEC2Role.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-windows-ec2-role-arn"
+
+  WindowsEC2InstanceProfileArn:
+    Description: "Windows EC2 Instance Profile ARN"
+    Value: !GetAtt WindowsEC2InstanceProfile.Arn
+    Export:
+      Name: !Sub "${ApplicationName}-windows-ec2-instance-profile-arn"
+
+  WindowsEC2VolumeId:
+    Description: "Windows EC2 EBS Volume ID"
+    Value: !Ref WindowsEC2Volume
+    Export:
+      Name: !Sub "${ApplicationName}-windows-volume-id"

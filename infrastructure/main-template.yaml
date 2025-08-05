@@ -1,0 +1,262 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Main Orchestration Template - Scheduled File Writer with nested stack architecture"
+
+Parameters:
+  # VPC and Networking Parameters
+  VpcCidr:
+    Type: String
+    Default: "10.1.0.0/16"
+    Description: "CIDR block for the VPC"
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: "Must be a valid CIDR block"
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: "10.1.1.0/24"
+    Description: "CIDR block for the private subnet"
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: "Must be a valid CIDR block"
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: "Availability Zone for the private subnet"
+
+  ApplicationName:
+    Type: String
+    Default: "scheduled-file-writer"
+    Description: "Name of the application for resource naming"
+
+  # Compute Parameters
+  WindowsInstanceType:
+    Type: String
+    Default: "t3.micro"
+    Description: "EC2 instance type for Windows file server"
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  SMBUsername:
+    Type: String
+    Default: "smbuser"
+    Description: "Username for SMB authentication"
+    MinLength: 3
+    MaxLength: 20
+
+  SMBPassword:
+    Type: String
+    NoEcho: true
+    Description: "Password for SMB authentication (must meet Windows complexity: 8+ chars, 3 of: uppercase, lowercase, digit, special char)"
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: '^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$|^(?=.*[a-z])(?=.*[A-Z])(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$|^(?=.*[a-z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$|^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:"\\|,.<>?]).{8,}$'
+    ConstraintDescription: "Password must be 8-128 characters and contain at least 3 of: uppercase letter, lowercase letter, digit, special character (!@#$%^&*()_+-=[]{}|;:,.<>?)"
+
+  # Application Parameters
+  ECRRepositoryURI:
+    Type: String
+    Description: "ECR repository URI for the application image"
+
+  CPUArchitecture:
+    Type: String
+    Default: "ARM64"
+    Description: "CPU architecture for ECS tasks (must match Docker image architecture)"
+    AllowedValues:
+      - X86_64
+      - ARM64
+
+  # S3 Bucket for nested templates
+  S3BucketName:
+    Type: String
+    Description: "S3 bucket name containing nested stack templates"
+
+Resources:
+  # Networking Stack - Foundation layer (no dependencies)
+  NetworkingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketName}/templates/networking-stack.yaml"
+      Parameters:
+        VpcCidr: !Ref VpcCidr
+        PrivateSubnetCidr: !Ref PrivateSubnetCidr
+        AvailabilityZone: !Ref AvailabilityZone
+        ApplicationName: !Ref ApplicationName
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-networking-stack"
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: StackType
+          Value: "Networking"
+
+  # Compute Stack - Depends on Networking Stack (no S3 dependency for SMB setup)
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkingStack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketName}/templates/compute-stack.yaml"
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        WindowsInstanceType: !Ref WindowsInstanceType
+        SMBUsername: !Ref SMBUsername
+        SMBPassword: !Ref SMBPassword
+        AvailabilityZone: !Ref AvailabilityZone
+        # Parameters from Networking Stack
+        VPCId: !GetAtt NetworkingStack.Outputs.VPCId
+        PrivateSubnetId: !GetAtt NetworkingStack.Outputs.PrivateSubnetId
+        WindowsEC2SecurityGroupId: !GetAtt NetworkingStack.Outputs.WindowsEC2SecurityGroupId
+      TimeoutInMinutes: 45
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-compute-stack"
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: StackType
+          Value: "Compute"
+
+  # Application Stack - Depends on both Networking and Compute Stacks
+  ApplicationStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkingStack
+      - ComputeStack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketName}/templates/application-stack.yaml"
+      Parameters:
+        ApplicationName: !Ref ApplicationName
+        ECRRepositoryURI: !Ref ECRRepositoryURI
+        CPUArchitecture: !Ref CPUArchitecture
+        # Parameters from Networking Stack
+        VPCId: !GetAtt NetworkingStack.Outputs.VPCId
+        PrivateSubnetId: !GetAtt NetworkingStack.Outputs.PrivateSubnetId
+        ECSTaskSecurityGroupId: !GetAtt NetworkingStack.Outputs.ECSTaskSecurityGroupId
+        # Parameters from Compute Stack
+        WindowsEC2PrivateIP: !GetAtt ComputeStack.Outputs.WindowsEC2PrivateIP
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-application-stack"
+        - Key: Application
+          Value: !Ref ApplicationName
+        - Key: StackType
+          Value: "Application"
+
+Outputs:
+  # VPC and Networking Outputs
+  VPCId:
+    Description: "VPC ID"
+    Value: !GetAtt NetworkingStack.Outputs.VPCId
+
+  PrivateSubnetId:
+    Description: "Private Subnet ID"
+    Value: !GetAtt NetworkingStack.Outputs.PrivateSubnetId
+
+  ECSTaskSecurityGroupId:
+    Description: "ECS Task Security Group ID"
+    Value: !GetAtt NetworkingStack.Outputs.ECSTaskSecurityGroupId
+
+  WindowsEC2SecurityGroupId:
+    Description: "Windows EC2 Security Group ID"
+    Value: !GetAtt NetworkingStack.Outputs.WindowsEC2SecurityGroupId
+
+  VPCEndpointSecurityGroupId:
+    Description: "VPC Endpoint Security Group ID"
+    Value: !GetAtt NetworkingStack.Outputs.VPCEndpointSecurityGroupId
+
+  # VPC Endpoint Outputs
+  ECRAPIEndpointId:
+    Description: "ECR API VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.ECRAPIEndpointId
+
+  ECRDKREndpointId:
+    Description: "ECR DKR VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.ECRDKREndpointId
+
+  CloudWatchLogsEndpointId:
+    Description: "CloudWatch Logs VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.CloudWatchLogsEndpointId
+
+  SSMEndpointId:
+    Description: "SSM VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.SSMEndpointId
+
+  SSMMessagesEndpointId:
+    Description: "SSM Messages VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.SSMMessagesEndpointId
+
+  EC2MessagesEndpointId:
+    Description: "EC2 Messages VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.EC2MessagesEndpointId
+
+  EC2EndpointId:
+    Description: "EC2 VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.EC2EndpointId
+
+  KMSEndpointId:
+    Description: "KMS VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.KMSEndpointId
+
+  SecretsManagerEndpointId:
+    Description: "Secrets Manager VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.SecretsManagerEndpointId
+
+  CloudFormationEndpointId:
+    Description: "CloudFormation VPC Endpoint ID"
+    Value: !GetAtt NetworkingStack.Outputs.CloudFormationEndpointId
+
+  # Compute Outputs
+  WindowsEC2InstanceId:
+    Description: "Windows EC2 Instance ID"
+    Value: !GetAtt ComputeStack.Outputs.WindowsEC2InstanceId
+
+  WindowsEC2PrivateIP:
+    Description: "Windows EC2 Private IP Address"
+    Value: !GetAtt ComputeStack.Outputs.WindowsEC2PrivateIP
+
+  WindowsEC2VolumeId:
+    Description: "Windows EC2 EBS Volume ID"
+    Value: !GetAtt ComputeStack.Outputs.WindowsEC2VolumeId
+
+  # Application Outputs
+  ECSClusterArn:
+    Description: "ECS Cluster ARN"
+    Value: !GetAtt ApplicationStack.Outputs.ECSClusterArn
+
+  ECSTaskDefinitionArn:
+    Description: "ECS Task Definition ARN"
+    Value: !GetAtt ApplicationStack.Outputs.ECSTaskDefinitionArn
+
+  ECSLogGroupName:
+    Description: "CloudWatch Log Group Name for ECS Tasks"
+    Value: !GetAtt ApplicationStack.Outputs.ECSLogGroupName
+
+  EventBridgeRuleArn:
+    Description: "EventBridge Rule ARN"
+    Value: !GetAtt ApplicationStack.Outputs.EventBridgeRuleArn
+
+  EventBridgeRuleName:
+    Description: "EventBridge Rule Name"
+    Value: !GetAtt ApplicationStack.Outputs.EventBridgeRuleArn
+
+  # Stack Information
+  NetworkingStackId:
+    Description: "Networking Stack ID"
+    Value: !Ref NetworkingStack
+
+  ComputeStackId:
+    Description: "Compute Stack ID"
+    Value: !Ref ComputeStack
+
+  ApplicationStackId:
+    Description: "Application Stack ID"
+    Value: !Ref ApplicationStack
+
+  # Template Information
+  MainTemplateVersion:
+    Description: "Main template version and creation timestamp"
+    Value: "v1.1 - Nested Stack Architecture (Embedded SMB Setup)"
+
+  StackArchitecture:
+    Description: "Stack architecture type"
+    Value: "Nested Stacks - Networking → Compute (Embedded SMB) → Application"

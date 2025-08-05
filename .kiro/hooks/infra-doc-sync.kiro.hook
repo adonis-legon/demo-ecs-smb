@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "name": "Infrastructure Documentation Sync",
+  "description": "Automatically updates the diagram and cost estimate in design.md whenever any infrastructure resource files are modified",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "infrastructure/*",
+      "docker-compose.yml",
+      "Dockerfile",
+      "scripts/deploy-stack.sh",
+      "scripts/destroy-stack.sh",
+      "scripts/setup-parameters.sh"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Infrastructure resources have been updated. Please analyze the changes and update the design.md file to reflect any modifications to the system architecture diagram and recalculate the cost estimate based on the new infrastructure configuration."
+  }
+}

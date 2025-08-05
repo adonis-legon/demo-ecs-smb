@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    
+    <!-- Standard Console Appender for Development -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %X{correlationId:-} %msg%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <target>System.out</target>
+    </appender>
+
+    <!-- JSON Console Appender for Production/CloudWatch -->
+    <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <providers>
+                <timestamp>
+                    <timeZone>UTC</timeZone>
+                </timestamp>
+                <logLevel/>
+                <loggerName/>
+                <message/>
+                <mdc/>
+                <arguments/>
+                <stackTrace/>
+                <pattern>
+                    <pattern>
+                        {
+                            "application": "scheduled-file-writer",
+                            "version": "1.0.0",
+                            "environment": "${ENVIRONMENT:-unknown}",
+                            "correlationId": "%X{correlationId:-}",
+                            "executionId": "%X{executionId:-}",
+                            "operation": "%X{operation:-}",
+                            "duration": "%X{duration:-}",
+                            "fileCount": "%X{fileCount:-}",
+                            "connectionStatus": "%X{connectionStatus:-}",
+                            "errorType": "%X{errorType:-}"
+                        }
+                    </pattern>
+                </pattern>
+            </providers>
+        </encoder>
+        <target>System.out</target>
+    </appender>
+
+    <!-- Async Console Appender for better performance -->
+    <appender name="ASYNC_CONSOLE" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="CONSOLE"/>
+        <queueSize>512</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- Async JSON Console Appender for Production -->
+    <appender name="ASYNC_JSON_CONSOLE" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="JSON_CONSOLE"/>
+        <queueSize>512</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+
+    <!-- Application-specific logger -->
+    <logger name="com.example.scheduledfilewriter" level="INFO" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- AWS SDK logger (reduce verbosity) -->
+    <logger name="software.amazon.awssdk" level="WARN" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- JCIFS logger (reduce verbosity) -->
+    <logger name="jcifs" level="WARN" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- Spring Framework logger (reduce verbosity) -->
+    <logger name="org.springframework" level="WARN" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- Hibernate Validator logger (reduce verbosity) -->
+    <logger name="org.hibernate.validator" level="WARN" additivity="false">
+        <appender-ref ref="CONSOLE"/>
+    </logger>
+
+    <!-- Root logger configuration -->
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+    <!-- Profile-specific configurations -->
+    <springProfile name="dev,development,local">
+        <logger name="com.example.scheduledfilewriter" level="DEBUG"/>
+        <root level="INFO">
+            <appender-ref ref="ASYNC_CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="prod,production,aws">
+        <logger name="com.example.scheduledfilewriter" level="INFO"/>
+        <root level="WARN">
+            <appender-ref ref="ASYNC_JSON_CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <!-- Default profile uses standard console logging -->
+    <springProfile name="!dev,!development,!local,!prod,!production,!aws">
+        <logger name="com.example.scheduledfilewriter" level="INFO"/>
+        <root level="INFO">
+            <appender-ref ref="ASYNC_CONSOLE"/>
+        </root>
+    </springProfile>
+
+</configuration>

@@ -1,0 +1,723 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Networking Stack - VPC, subnets, security groups, and VPC endpoints for Scheduled File Writer"
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: "10.1.0.0/16"
+    Description: "CIDR block for the VPC"
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: "Must be a valid CIDR block"
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: "10.1.1.0/24"
+    Description: "CIDR block for the private subnet"
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    ConstraintDescription: "Must be a valid CIDR block"
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: "Availability Zone for the private subnet"
+
+  ApplicationName:
+    Type: String
+    Default: "scheduled-file-writer"
+    Description: "Name of the application for resource naming"
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-vpc"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Private Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-private-subnet"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Route Table for Private Subnet
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-private-rt"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Associate Route Table with Private Subnet
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security Group for ECS Tasks
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for ECS tasks"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS outbound for AWS services (fallback)"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-ecs-sg"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Security Group for Windows EC2
+  WindowsEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Windows EC2 file server"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS outbound for AWS services via VPC endpoints"
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: "DNS outbound for name resolution"
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: "DNS TCP outbound for name resolution"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-windows-sg"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Security Group for VPC Endpoints
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for VPC endpoints"
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS outbound to AWS services"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ApplicationName}-vpce-sg"
+        - Key: Application
+          Value: !Ref ApplicationName
+
+  # Security Group Rule: ECS to Windows EC2 SMB (port 445)
+  ECSToWindowsSMBRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 445
+      ToPort: 445
+      DestinationSecurityGroupId: !Ref WindowsEC2SecurityGroup
+      Description: "SMB outbound to Windows EC2"
+
+  # Security Group Rule: ECS to Windows EC2 NetBIOS (port 139)
+  ECSToWindowsNetBIOSRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 139
+      ToPort: 139
+      DestinationSecurityGroupId: !Ref WindowsEC2SecurityGroup
+      Description: "NetBIOS outbound to Windows EC2"
+
+  # Security Group Rule: ECS to Windows EC2 RPC Endpoint Mapper (port 135)
+  ECSToWindowsRPCRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 135
+      ToPort: 135
+      DestinationSecurityGroupId: !Ref WindowsEC2SecurityGroup
+      Description: "RPC Endpoint Mapper outbound to Windows EC2"
+
+  # Security Group Rule: ECS to Windows EC2 Dynamic RPC ports
+  ECSToWindowsDynamicRPCRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1024
+      ToPort: 65535
+      DestinationSecurityGroupId: !Ref WindowsEC2SecurityGroup
+      Description: "Dynamic RPC ports outbound to Windows EC2"
+
+  # Security Group Rule: Windows EC2 from ECS SMB (port 445)
+  WindowsFromECSSMBRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 445
+      ToPort: 445
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "SMB inbound from ECS tasks"
+
+  # Security Group Rule: Windows EC2 from ECS NetBIOS (port 139)
+  WindowsFromECSNetBIOSRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 139
+      ToPort: 139
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "NetBIOS inbound from ECS tasks"
+
+  # Security Group Rule: Windows EC2 from ECS RPC Endpoint Mapper (port 135)
+  WindowsFromECSRPCRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 135
+      ToPort: 135
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "RPC Endpoint Mapper inbound from ECS tasks"
+
+  # Security Group Rule: Windows EC2 from ECS Dynamic RPC ports
+  WindowsFromECSDynamicRPCRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 1024
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "Dynamic RPC ports inbound from ECS tasks"
+
+  # Security Group Rule: ECS to VPC Endpoints HTTPS
+  ECSToVPCEndpointsRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: "HTTPS outbound to VPC endpoints for ECR and AWS services"
+
+  # Security Group Rule: VPC Endpoints from ECS HTTPS
+  VPCEndpointFromECSRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "HTTPS inbound from ECS tasks for ECR and AWS services"
+
+  # Security Group Rule: ECS outbound for ECR API access
+  ECSToECRAPIRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: "HTTPS outbound for ECR API endpoint access"
+
+  # Security Group Rule: ECS outbound for ECR DKR access
+  ECSToECRDKRRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: "HTTPS outbound for ECR DKR endpoint access"
+
+  # Security Group Rule: VPC Endpoint inbound for ECR API
+  VPCEndpointFromECRAPIRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "HTTPS inbound for ECR API endpoint communication"
+
+  # Security Group Rule: VPC Endpoint inbound for ECR DKR
+  VPCEndpointFromECRDKRRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+      Description: "HTTPS inbound for ECR DKR endpoint communication"
+
+  # Security Group Rule: ECS outbound DNS for endpoint resolution
+  ECSOutboundDNSRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: "DNS outbound for VPC endpoint resolution"
+
+  # Security Group Rule: ECS outbound DNS TCP for endpoint resolution
+  ECSOutboundDNSTCPRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: "DNS TCP outbound for VPC endpoint resolution"
+
+  # Security Group Rule: Windows EC2 to VPC Endpoints HTTPS
+  WindowsToVPCEndpointsRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+      Description: "HTTPS outbound to VPC endpoints for SSM and AWS services"
+
+  # Security Group Rule: VPC Endpoints from Windows EC2 HTTPS
+  VPCEndpointFromWindowsRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref WindowsEC2SecurityGroup
+      Description: "HTTPS inbound from Windows EC2 for SSM and AWS services"
+
+  # Security Group Rule: Windows EC2 outbound DNS for endpoint resolution
+  WindowsOutboundDNSRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: "DNS outbound for VPC endpoint resolution"
+
+  # Security Group Rule: Windows EC2 outbound DNS TCP for endpoint resolution
+  WindowsOutboundDNSTCPRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref WindowsEC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+      Description: "DNS TCP outbound for VPC endpoint resolution"
+  # VPC Endpoint for ECR API
+  ECRAPIEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for ECR DKR
+  ECRDKREndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for CloudWatch Logs
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+              - logs:DescribeLogGroups
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for SSM
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+              - ssm:UpdateInstanceInformation
+              - ssm:SendCommand
+              - ssm:ListCommandInvocations
+              - ssm:DescribeInstanceInformation
+              - ssm:GetCommandInvocation
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for SSM Messages (required for Session Manager)
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for EC2 Messages (required for Session Manager)
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - ec2messages:AcknowledgeMessage
+              - ec2messages:DeleteMessage
+              - ec2messages:FailMessage
+              - ec2messages:GetEndpoint
+              - ec2messages:GetMessages
+              - ec2messages:SendReply
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for EC2 (required for Windows instance metadata and licensing)
+  EC2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceAttribute
+              - ec2:DescribeRegions
+              - ec2:DescribeSnapshots
+              - ec2:DescribeVolumes
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for KMS (required for Windows licensing and EBS encryption)
+  KMSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.kms"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for Secrets Manager
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # VPC Endpoint for CloudFormation
+  CloudFormationEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.cloudformation"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - cloudformation:SignalResource
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackResources
+            Resource: "*"
+      PrivateDnsEnabled: true
+
+  # S3 Gateway VPC Endpoint for ECR image layer downloads
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: "*"
+Outputs:
+  VPCId:
+    Description: "VPC ID"
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ApplicationName}-vpc-id"
+
+  PrivateSubnetId:
+    Description: "Private Subnet ID"
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub "${ApplicationName}-private-subnet-id"
+
+  PrivateRouteTableId:
+    Description: "Private Route Table ID"
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub "${ApplicationName}-private-route-table-id"
+
+  ECSTaskSecurityGroupId:
+    Description: "ECS Task Security Group ID"
+    Value: !Ref ECSTaskSecurityGroup
+    Export:
+      Name: !Sub "${ApplicationName}-ecs-sg-id"
+
+  WindowsEC2SecurityGroupId:
+    Description: "Windows EC2 Security Group ID"
+    Value: !Ref WindowsEC2SecurityGroup
+    Export:
+      Name: !Sub "${ApplicationName}-windows-sg-id"
+
+  VPCEndpointSecurityGroupId:
+    Description: "VPC Endpoint Security Group ID"
+    Value: !Ref VPCEndpointSecurityGroup
+    Export:
+      Name: !Sub "${ApplicationName}-vpce-sg-id"
+
+  ECRAPIEndpointId:
+    Description: "ECR API VPC Endpoint ID"
+    Value: !Ref ECRAPIEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-ecr-api-endpoint-id"
+
+  ECRDKREndpointId:
+    Description: "ECR DKR VPC Endpoint ID"
+    Value: !Ref ECRDKREndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-ecr-dkr-endpoint-id"
+
+  CloudWatchLogsEndpointId:
+    Description: "CloudWatch Logs VPC Endpoint ID"
+    Value: !Ref CloudWatchLogsEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-logs-endpoint-id"
+
+  SSMEndpointId:
+    Description: "SSM VPC Endpoint ID"
+    Value: !Ref SSMEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-ssm-endpoint-id"
+
+  SSMMessagesEndpointId:
+    Description: "SSM Messages VPC Endpoint ID"
+    Value: !Ref SSMMessagesEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-ssm-messages-endpoint-id"
+
+  EC2MessagesEndpointId:
+    Description: "EC2 Messages VPC Endpoint ID"
+    Value: !Ref EC2MessagesEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-ec2-messages-endpoint-id"
+
+  EC2EndpointId:
+    Description: "EC2 VPC Endpoint ID"
+    Value: !Ref EC2Endpoint
+    Export:
+      Name: !Sub "${ApplicationName}-ec2-endpoint-id"
+
+  KMSEndpointId:
+    Description: "KMS VPC Endpoint ID"
+    Value: !Ref KMSEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-kms-endpoint-id"
+
+  SecretsManagerEndpointId:
+    Description: "Secrets Manager VPC Endpoint ID"
+    Value: !Ref SecretsManagerEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-secrets-manager-endpoint-id"
+
+  CloudFormationEndpointId:
+    Description: "CloudFormation VPC Endpoint ID"
+    Value: !Ref CloudFormationEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-cloudformation-endpoint-id"
+
+  S3GatewayEndpointId:
+    Description: "S3 Gateway VPC Endpoint ID"
+    Value: !Ref S3GatewayEndpoint
+    Export:
+      Name: !Sub "${ApplicationName}-s3-gateway-endpoint-id"

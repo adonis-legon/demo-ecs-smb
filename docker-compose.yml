@@ -1,0 +1,118 @@
+version: "3.8"
+
+services:
+  # Samba server for local development
+  samba-server:
+    image: dperson/samba:latest
+    container_name: scheduled-file-writer-samba
+    restart: unless-stopped
+    ports:
+      - "1445:445" # Map to port 1445 to match test script
+      - "1139:139" # Map to port 1139 to avoid conflicts
+    environment:
+      # Create a user for SMB authentication
+      - USER=testuser;testpass123
+      # Create a share with full write permissions for testuser
+      - SHARE=fileshare;/shared;yes;no;no;testuser;testuser;0775
+      # Set workgroup
+      - WORKGROUP=WORKGROUP
+      # Enable SMB protocols
+      - SMB=true
+      # Set timezone
+      - TZ=UTC
+      # Set proper permissions on shared directory
+      - USERID=1000
+      - GROUPID=1000
+    volumes:
+      - samba-data:/shared
+      - ./local-dev/samba-config:/etc/samba/external
+    networks:
+      - scheduled-file-writer-net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "smbclient",
+          "-L",
+          "localhost",
+          "-U",
+          "testuser%testpass123",
+          "-m",
+          "SMB3",
+          "--option=client min protocol=SMB2",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Java application
+  scheduled-file-writer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scheduled-file-writer-app
+    depends_on:
+      samba-server:
+        condition: service_healthy
+    environment:
+      # SMB connection configuration
+      - FILE_SHARE_HOST=samba-server
+      - FILE_SHARE_PATH=fileshare
+      - SMB_USERNAME=testuser
+      - SMB_PASSWORD=testpass123
+      - SMB_DOMAIN=WORKGROUP
+      - CONNECTION_TIMEOUT=30
+      - FILE_COUNT=10
+      # Logging configuration
+      - LOGGING_LEVEL_ROOT=INFO
+      - LOGGING_LEVEL_COM_EXAMPLE=DEBUG
+      # Spring Integration SMB configuration
+      - JAVA_OPTS=-Dspring.profiles.active=docker
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - scheduled-file-writer-net
+    profiles:
+      - manual # Don't start automatically, use for manual testing
+
+  # One-time test runner
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scheduled-file-writer-test
+    depends_on:
+      samba-server:
+        condition: service_healthy
+    environment:
+      # SMB connection configuration
+      - FILE_SHARE_HOST=samba-server
+      - FILE_SHARE_PATH=fileshare
+      - SMB_USERNAME=testuser
+      - SMB_PASSWORD=testpass123
+      - SMB_DOMAIN=WORKGROUP
+      - CONNECTION_TIMEOUT=30
+      - FILE_COUNT=10
+      # Logging configuration
+      - LOGGING_LEVEL_ROOT=INFO
+      - LOGGING_LEVEL_COM_EXAMPLE=DEBUG
+      # Spring Integration SMB configuration
+      - JAVA_OPTS=-Dspring.profiles.active=docker
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - scheduled-file-writer-net
+    profiles:
+      - test # Use for testing
+
+volumes:
+  samba-data:
+    driver: local
+
+networks:
+  scheduled-file-writer-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

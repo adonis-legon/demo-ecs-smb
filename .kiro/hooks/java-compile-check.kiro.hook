@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "name": "Java Compile Check",
+  "description": "Automatically runs a compile check whenever Java application code is modified to ensure the code wasn't broken",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "src/main/java/**/*.java",
+      "src/test/java/**/*.java",
+      "pom.xml"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Java code has been modified. Please run a Maven compile to check that the code was not broken. Use 'mvn compile' to compile the main code and 'mvn test-compile' to compile the test code. Report any compilation errors found."
+  }
+}

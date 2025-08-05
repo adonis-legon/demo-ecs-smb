@@ -1,0 +1,13 @@
+{
+  "name": "Java Compile Check",
+  "description": "Automatically compile Java code when changes are made to verify no compilation errors",
+  "trigger": {
+    "type": "file_change",
+    "patterns": ["src/main/java/**/*.java", "src/test/java/**/*.java"]
+  },
+  "action": {
+    "type": "agent_request",
+    "request": "Compile the Java application using Maven to check for compilation errors. Run 'mvn compile' and report any issues found."
+  },
+  "enabled": true
+}
