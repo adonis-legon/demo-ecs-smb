@@ -79,14 +79,36 @@ load_bucket_config() {
     local config_file="infrastructure/config/s3-bucket.conf"
     
     if [[ -z "$BUCKET_NAME" ]]; then
-        if [[ -f "$config_file" ]]; then
-            echo "📖 Loading bucket configuration from $config_file"
-            source "$config_file"
-            echo "Found bucket: $BUCKET_NAME"
+        # First try to load from SSM Parameter Store (new approach)
+        echo "📖 Loading bucket configuration from SSM Parameter Store..."
+        local ssm_param="/$APPLICATION_NAME/s3/bucket-name"
+        
+        if BUCKET_NAME=$(aws ssm get-parameter --name "$ssm_param" --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null); then
+            echo "Found bucket in SSM: $BUCKET_NAME"
         else
-            echo "❌ Bucket name not provided and config file not found: $config_file"
-            echo "Please provide --bucket-name or ensure the config file exists"
-            exit 1
+            # Fallback to old config file approach
+            if [[ -f "$config_file" ]]; then
+                echo "📖 Loading bucket configuration from $config_file"
+                source "$config_file"
+                echo "Found bucket: $BUCKET_NAME"
+            else
+                # If neither SSM nor config file exists, try to generate bucket name like setup script does
+                echo "📝 Generating bucket name using same logic as setup script..."
+                local account_id=$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null)
+                if [[ -n "$account_id" ]]; then
+                    BUCKET_NAME="cf-templates-${account_id}-${REGION}-${APPLICATION_NAME}"
+                    echo "Generated bucket name: $BUCKET_NAME"
+                else
+                    echo "❌ Bucket name not provided and could not be determined automatically"
+                    echo "Please provide --bucket-name parameter"
+                    echo ""
+                    echo "💡 You can find the bucket name by running:"
+                    echo "  aws ssm get-parameter --name /$APPLICATION_NAME/s3/bucket-name --query 'Parameter.Value' --output text --profile $PROFILE"
+                    echo "  OR"
+                    echo "  aws s3 ls --profile $PROFILE | grep cf-templates"
+                    exit 1
+                fi
+            fi
         fi
     fi
 }
@@ -207,13 +229,21 @@ delete_bucket() {
     echo "✅ S3 bucket deleted successfully"
 }
 
-# Function to clean up local files
+# Function to clean up local files and SSM parameters
 cleanup_local_files() {
-    echo "🧹 Cleaning up local configuration files..."
+    echo "🧹 Cleaning up local configuration files and SSM parameters..."
     
     local config_file="infrastructure/config/s3-bucket.conf"
     local readme_file="infrastructure/nested-stacks/README.md"
     
+    # Clean up SSM parameter
+    local ssm_param="/$APPLICATION_NAME/s3/bucket-name"
+    if aws ssm get-parameter --name "$ssm_param" --region "$REGION" >/dev/null 2>&1; then
+        aws ssm delete-parameter --name "$ssm_param" --region "$REGION" >/dev/null 2>&1
+        echo "  ✅ Removed SSM parameter: $ssm_param"
+    fi
+    
+    # Clean up old config file if it exists
     if [[ -f "$config_file" ]]; then
         rm -f "$config_file"
         echo "  ✅ Removed: $config_file"
@@ -254,6 +284,15 @@ verify_destruction() {
         echo "✅ Bucket successfully removed"
     fi
     
+    # Check SSM parameter
+    local ssm_param="/$APPLICATION_NAME/s3/bucket-name"
+    if aws ssm get-parameter --name "$ssm_param" --region "$REGION" >/dev/null 2>&1; then
+        echo "⚠️  SSM parameter still exists: $ssm_param"
+    else
+        echo "✅ SSM parameter cleaned up"
+    fi
+    
+    # Check old config file
     local config_file="infrastructure/config/s3-bucket.conf"
     if [[ -f "$config_file" ]]; then
         echo "⚠️  Configuration file still exists: $config_file"
@@ -277,6 +316,7 @@ display_summary() {
     echo "  • S3 bucket and all contents"
     echo "  • All object versions and delete markers"
     echo "  • Bucket policies and configurations"
+    echo "  • SSM parameter: /$APPLICATION_NAME/s3/bucket-name"
     echo "  • Local configuration files"
     echo ""
     echo "💡 To recreate the infrastructure:"

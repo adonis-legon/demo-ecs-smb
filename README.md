@@ -217,15 +217,17 @@ aws ssm start-session --target INSTANCE_ID --profile YOUR_AWS_PROFILE --region Y
 
 ### Step 6: Cleanup (When Done)
 
-To completely remove all resources:
+To completely remove all resources, follow these steps in order:
 
 ```bash
-# Option 1: Destroy just the CloudFormation stack (keeps S3 bucket)
+# Step 1: Destroy the CloudFormation stack first
 ./scripts/destroy-stack.sh --profile YOUR_AWS_PROFILE --region YOUR_REGION
 
-# Option 2: Complete cleanup including S3 bucket and templates
+# Step 2: Clean up remaining infrastructure (S3 bucket, templates, SSM parameters)
 ./scripts/destroy-nested-stacks.sh --profile YOUR_AWS_PROFILE --region YOUR_REGION
 ```
+
+**Note**: You must run `destroy-stack.sh` first to remove the CloudFormation stack, then run `destroy-nested-stacks.sh` to clean up the supporting infrastructure. Running them in the wrong order may cause issues.
 
 ## 📋 Quick Reference Commands
 
@@ -284,17 +286,22 @@ The following section is maintained for reference but uses the new streamlined a
 
 Choose the appropriate cleanup method based on your needs:
 
-#### Option 1: Keep Templates and Parameters (Recommended for Development)
+#### Option 1: Partial Cleanup (Recommended for Development)
 
 ```bash
-# Destroys only the CloudFormation stack, keeps S3 bucket and SSM parameters
+# Destroys only the CloudFormation stack, keeps S3 bucket and SSM parameters for reuse
 ./scripts/destroy-stack.sh --profile YOUR_AWS_PROFILE --region YOUR_REGION
 ```
 
 #### Option 2: Complete Cleanup (Production/Final Cleanup)
 
+For complete removal of all resources, run both scripts in sequence:
+
 ```bash
-# Destroys everything: stack, S3 bucket, templates, and SSM parameters
+# Step 1: Destroy the CloudFormation stack
+./scripts/destroy-stack.sh --profile YOUR_AWS_PROFILE --region YOUR_REGION
+
+# Step 2: Clean up supporting infrastructure (S3 bucket, templates, SSM parameters)
 ./scripts/destroy-nested-stacks.sh --profile YOUR_AWS_PROFILE --region YOUR_REGION
 
 # Optional: Also remove ECR repository
