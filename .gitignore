@@ -116,8 +116,8 @@ local-dev/.env.local
 # CloudFormation generated files
 infrastructure/config/s3-bucket.conf
 
-# Docker
-.dockerignore
+# Docker build artifacts
+# Note: .dockerignore should be committed to git
 
 # Application specific
 application.log
